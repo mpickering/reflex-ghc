@@ -1,0 +1,3 @@
+packages: . ghcide/
+
+allow-newer: reflex-basic-host:all
