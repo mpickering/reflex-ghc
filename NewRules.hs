@@ -9,6 +9,7 @@
 {-# LANGUAGE NoMonoLocalBinds #-}
 module NewRules where
 
+import Reflex.Network
 import System.Directory
 import Reflex
 import GHC hiding (parseModule, mkModule, typecheckModule, getSession)
@@ -86,46 +87,62 @@ data ModuleState t = ModuleState { fileChanged :: Event t NormalizedFilePath
 data GlobalEnv t = GlobalEnv { opts :: (Dynamic t IdeOptions)
                              , env :: (Dynamic t HscEnv) }
 
-type ModuleMap t = M.Map NormalizedFilePath (ModuleState t)
+type ModuleMap t = (Dynamic t (M.Map NormalizedFilePath (ModuleState t)))
+
+data ModuleMapWithUpdater t =
+  MMU {
+    getMap :: ModuleMap t
+    , updateMap :: [NormalizedFilePath] -> IO ()
+    }
+
+currentMap = current . getMap
+updatedMap = updated . getMap
+
 
 modules = map toNormalizedFilePath ["A.hs", "B.hs"]
 
+singleton x = [x]
 
-
-mkModuleMap :: _ => Dynamic t IdeOptions
+mkModuleMap :: forall t m . (Monad m, MonadHold t m, _ ) => Dynamic t IdeOptions
                  -> Dynamic t HscEnv
-                 -> [NormalizedFilePath]
                  -> Event t NormalizedFilePath
                  -> m (ModuleMap t)
-mkModuleMap o e fps input = mdo
-  x <- M.fromList <$> mapM (\f -> (f,) <$> (mkModule o e input x f)) modules
-  return x
+mkModuleMap o e input = mdo
+  -- An event which is triggered to update the incremental
+  (map_update, update_trigger) <- newTriggerEvent
+  let mk_patch ((fp, v), _) = v
+      mkM fp = (fp, Just (mkModule o e (MMU mod_map update_trigger) fp))
+      mk_module fp act _ = mk_patch <$> act
+      inp = M.fromList . map mkM <$> mergeWith (++) [(singleton <$> input), map_update]
+--  let input_event = (fmap mk_patch . mkModule o e mod_map <$> input)
 
-type Action t m a = NormalizedFilePath -> GlobalEnv t -> ModuleMap t -> MaybeT m (IdeResult a)
+  mod_map <- listWithKeyShallowDiff M.empty inp mk_module  --(mergeWith (<>) [input_event, map_update])
+
+  return mod_map
+
+type Action t m a = NormalizedFilePath -> GlobalEnv t -> ModuleMapWithUpdater t -> MaybeT m (IdeResult a)
 
 mkModule :: forall t m . _ => Dynamic t IdeOptions
               -> Dynamic t HscEnv
-              -> Event t NormalizedFilePath
-              -> ModuleMap t
+              -> ModuleMapWithUpdater t
               -> NormalizedFilePath
-              -> m (ModuleState t)
-mkModule opts env fs mm f = do
-  pb <- getPostBuild
-  let fileChanged = ffilter (== f) fs
+              -> m ((NormalizedFilePath, ModuleState t), Dynamic t [FileDiagnostic])
+mkModule opts env mm f = runDynamicWriterT $ do
+  (start, trigger) <- newTriggerEvent
+  getParsedModule <- rule "pm" getParsedModuleRule start
+  getLocatedImports <- rule "gl" getLocatedImportsRule start
 
-  getParsedModule <- rule "pm" getParsedModuleRule (() <$ pb)
-  getLocatedImports <- rule "gl" getLocatedImportsRule (() <$ pb)
-
-  getDependencyInformation <- rule "di" getDependencyInformationRule (() <$ pb)
-  getDependencies <- rule "dep" getDependenciesRule (() <$ pb)
-  getTypecheckedModule <- rule "tm" typeCheckRule (() <$ pb)
-  getSpanInfo <- rule "si" getSpanInfoRule (() <$ pb)
+  getDependencyInformation <- rule "di" getDependencyInformationRule start
+  getDependencies <- rule "dep" getDependenciesRule start
+  getTypecheckedModule <- rule "tm" typeCheckRule start
+  getSpanInfo <- rule "si" getSpanInfoRule start
+  liftIO $ trigger ()
 
 
 
 --  let diags = distributeListOverDyn [pm_diags]
   let m = ModuleState{..}
-  return m
+  return (f, m)
 
   where
     rule rid act trigger = mdo
@@ -192,7 +209,7 @@ main = do
 --    env :: Dynamic t HscEnv
     env <- holdDyn session never
 
-    (mmap, diags2) <- runDynamicWriterT $ mkModuleMap opts env modules input
+    mmap <- mkModuleMap opts env input
 --    (mmap, diags2) <- test opts env modules input
     let diags = M.empty
         hover = M.empty
@@ -210,7 +227,7 @@ main = do
       threadDelay 1000000000
       liftIO $ input_trigger (toNormalizedFilePath "def")
 
-    performEvent_ $ liftIO . print <$> (updated diags2)
+    --performEvent_ $ liftIO . print <$> (updated diags2)
     return never
 
 
@@ -327,41 +344,50 @@ getSpanInfoRule fp genv ms = do
   x <- liftIO $ getSrcSpanInfos packageState fileImports tc tms
   return ([], Just x)
 
-sampleMaybe :: _ => ModuleMap t
+sampleMaybe :: _ => ModuleMapWithUpdater t
                  -> (ModuleState t -> Dynamic t (Maybe a))
                  -> NormalizedFilePath
                  -> MaybeT m a
 sampleMaybe m sel fp = do
-  case M.lookup fp m of
+  mm <- lift $ sample (currentMap m)
+  case M.lookup fp mm of
     Just ms -> MaybeT $ do
       tellEvent (() <$ updated (sel ms))
       sample (current (sel ms))
-    Nothing -> error "NOTHING" -- MaybeT $ return Nothing
+    Nothing -> MaybeT $ do
+      -- When the map updates, try again
+      tellEvent (() <$ updatedMap m)
+      liftIO $ updateMap m [fp]
+      return Nothing
 
 use_ = sampleMaybe
 
-uses_ :: _ => ModuleMap t
+uses_ :: _ => ModuleMapWithUpdater t
                  -> (ModuleState t -> Dynamic t (Maybe a))
                  -> [NormalizedFilePath]
                  -> MaybeT m [a]
 uses_ m sel fps = mapM (sampleMaybe m sel) fps
 
-uses :: _ => ModuleMap t
+uses :: _ => ModuleMapWithUpdater t
                  -> (ModuleState t -> Dynamic t (Maybe a))
                  -> [NormalizedFilePath]
                  -> MaybeT m [Maybe a]
 uses m sel fps = mapM (use m sel) fps
 
-use :: _ => ModuleMap t
+use :: _ => ModuleMapWithUpdater t
                  -> (ModuleState t -> Dynamic t (Maybe a))
                  -> NormalizedFilePath
                  -> MaybeT m (Maybe a)
 use m sel fp = do
-  case M.lookup fp m of
+  mm <- lift $ sample (currentMap m)
+  case M.lookup fp mm of
     Just ms -> lift $ do
       tellEvent (() <$ updated (sel ms))
       sample (current (sel ms))
-    Nothing -> lift $ return Nothing
+    Nothing -> lift $ do
+      tellEvent (() <$ updatedMap m)
+      liftIO $ updateMap m [fp]
+      return Nothing
 
 sampleG :: _ => Dynamic t a -> MaybeT m a
 sampleG d = lift $ sample (current d)
@@ -372,7 +398,7 @@ useGlobal g sel = sampleG (sel g)
 getIdeOptions g = useGlobal g opts
 getSession g = useGlobal g env
 
-getLocatedImportsRule :: _ => NormalizedFilePath -> GlobalEnv t -> ModuleMap t
+getLocatedImportsRule :: _ => NormalizedFilePath -> GlobalEnv t -> ModuleMapWithUpdater t
                        -> MaybeT m (IdeResult LocatedImports)
 getLocatedImportsRule file genv ms = do
             pm <- use_ ms getParsedModule file
