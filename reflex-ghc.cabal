@@ -24,4 +24,12 @@ executable reflex-ghc
   build-depends:       base >=4.12 && <5, reflex, ghc, ghcide, containers, filepath, extra, transformers, text, mtl, data-default, dependent-map, dependent-sum, reflex-basic-host, ghc-boot, hie-bios, ghc-paths, directory
   -- hs-source-dirs:
   default-language:    Haskell2010
-  ghc-options: -threaded
+  ghc-options: -threaded -eventlog
+
+executable analyse
+  main-is:             Analyse.hs
+  -- other-extensions:
+  build-depends:       base >=4.12 && <5,  containers, ghc-events, text
+  -- hs-source-dirs:
+  default-language:    Haskell2010
+  ghc-options: -threaded -eventlog

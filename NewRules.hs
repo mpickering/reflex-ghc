@@ -9,6 +9,7 @@
 {-# LANGUAGE NoMonoLocalBinds #-}
 module NewRules where
 
+import Reflex.Time
 import Reflex.Network
 import System.Directory
 import Reflex
@@ -54,6 +55,8 @@ import System.IO
 import Linker
 import qualified GHC.Paths
 import Control.Concurrent
+import Reflex.Profiled
+import Debug.Trace
 
 data HoverMap = HoverMap
 type Diagnostics = String
@@ -103,17 +106,18 @@ modules = map toNormalizedFilePath ["A.hs", "B.hs"]
 
 singleton x = [x]
 
-mkModuleMap :: forall t m . (Monad m, MonadHold t m, _ ) => Dynamic t IdeOptions
+mkModuleMap :: forall t m . (_ ) => Dynamic t IdeOptions
                  -> Dynamic t HscEnv
                  -> Event t NormalizedFilePath
                  -> m (ModuleMap t)
 mkModuleMap o e input = mdo
   -- An event which is triggered to update the incremental
   (map_update, update_trigger) <- newTriggerEvent
+  map_update' <- fmap concat <$> batchOccurrences 0.01 map_update
   let mk_patch ((fp, v), _) = v
       mkM fp = (fp, Just (mkModule o e (MMU mod_map update_trigger) fp))
       mk_module fp act _ = mk_patch <$> act
-      inp = M.fromList . map mkM <$> mergeWith (++) [(singleton <$> input), map_update]
+      inp = M.fromList . map mkM <$> mergeWith (++) [(singleton <$> input), map_update']
 --  let input_event = (fmap mk_patch . mkModule o e mod_map <$> input)
 
   mod_map <- listWithKeyShallowDiff M.empty inp mk_module  --(mergeWith (<>) [input_event, map_update])
@@ -148,14 +152,26 @@ mkModule opts env mm f = runDynamicWriterT $ do
     rule rid act trigger = mdo
         let wrap = fromMaybe ([], Nothing)
         act_trig <- switchHoldPromptly trigger (fmap (\e -> leftmost [trigger, e]) deps)
-        pm <- performEvent (runEventWriterT (runMaybeT (act f genv mm)) <$ act_trig)
+        pm <- performEvent (traceAction ident (runEventWriterT (runMaybeT (act f genv mm))) <$! act_trig)
         let (act_res, deps) = splitE pm
         d <- holdDyn ([], Nothing) (wrap <$> act_res)
         let (pm_diags, res) = splitDynPure d
         tellDyn pm_diags
-        return (traceDyn (show f ++ ": " ++ rid) res)
+        let ident = show f ++ ": " ++ rid
+        res' <- improvingMaybe res
+        return (traceDynE ("D:" ++ ident) res')
+--        return res
 
     genv = GlobalEnv opts env
+
+
+traceAction ident a = do
+  liftIO $ traceEventIO ("START:" ++ ident)
+  r <- a
+  liftIO $ traceEventIO ("END:" ++ ident)
+  return r
+
+traceDynE p d = traceDynWith (const $ Debug.Trace.traceEvent p p) d
 
 
 --test :: Dynamic t IdeOptions -> Dynamic t HscEnv -> [NormalizedFilePath] -> Event t NormalizedFilePath -> BasicGuest t m (ModuleMap t, Dynamic t [FileDiagnostic])
@@ -196,8 +212,8 @@ loadSession dir v = do
 
 
 main = do
-  session <- loadSession "/home/matt/reflex-ghc/test/" "/home/matt/reflex-ghc/test/hie.yaml"
-  setCurrentDirectory "/home/matt/reflex-ghc/test"
+  session <- loadSession "/home/matt/reflex-ghc/ghcide/" "/home/matt/reflex-ghc/ghcide/hie.yaml"
+  setCurrentDirectory "/home/matt/reflex-ghc/ghcide"
   basicHostWithQuit $ do
     pb <- getPostBuild
     (input, input_trigger) <- newTriggerEvent
@@ -220,10 +236,11 @@ main = do
     performEvent_ $ liftIO . print <$> input
 
     liftIO $ forkIO $ do
-      input_trigger (toNormalizedFilePath "A.hs")
+      input_trigger (toNormalizedFilePath "src/Development/IDE/Core/Rules.hs")
       threadDelay 1000000
 --      input_trigger (toNormalizedFilePath "B.hs")
       threadDelay 1000000
+      showProfilingData
       threadDelay 1000000000
       liftIO $ input_trigger (toNormalizedFilePath "def")
 
@@ -352,11 +369,12 @@ sampleMaybe m sel fp = do
   mm <- lift $ sample (currentMap m)
   case M.lookup fp mm of
     Just ms -> MaybeT $ do
-      tellEvent (() <$ updated (sel ms))
+      tellEvent (() <$! updated (sel ms))
       sample (current (sel ms))
     Nothing -> MaybeT $ do
       -- When the map updates, try again
-      tellEvent (() <$ updatedMap m)
+      liftIO $ traceEventIO "FAILED TO FIND"
+      tellEvent (() <$! updatedMap m)
       liftIO $ updateMap m [fp]
       return Nothing
 
@@ -382,12 +400,15 @@ use m sel fp = do
   mm <- lift $ sample (currentMap m)
   case M.lookup fp mm of
     Just ms -> lift $ do
-      tellEvent (() <$ updated (sel ms))
+      tellEvent (() <$! updated (sel ms))
       sample (current (sel ms))
     Nothing -> lift $ do
-      tellEvent (() <$ updatedMap m)
+      liftIO $ traceEventIO "FAILED TO FIND"
+      tellEvent (() <$! updatedMap m)
       liftIO $ updateMap m [fp]
       return Nothing
+
+(<$!) v fa = fmap (\a -> a `seq` v) fa
 
 sampleG :: _ => Dynamic t a -> MaybeT m a
 sampleG d = lift $ sample (current d)
