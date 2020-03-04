@@ -21,7 +21,7 @@ executable reflex-ghc
   main-is:             Main.hs
   other-modules: NewRules
   -- other-extensions:
-  build-depends:       base >=4.12 && <5, reflex, ghc, ghcide, containers, filepath, extra, transformers, text, mtl, data-default, dependent-map, dependent-sum, reflex-basic-host, ghc-boot, hie-bios, ghc-paths, directory
+  build-depends:       base >=4.12 && <5, reflex, ghc, ghcide, containers, filepath, extra, transformers, text, mtl, data-default, dependent-map, dependent-sum, reflex-basic-host, ghc-boot, hie-bios, ghc-paths, directory, errors, dependent-sum-template
   -- hs-source-dirs:
   default-language:    Haskell2010
   ghc-options: -threaded -eventlog

@@ -1,3 +1,6 @@
 [submodule "ghcide"]
 	path = ghcide
 	url = https://github.com/mpickering/ghcide.git
+[submodule "dependent-sum"]
+	path = dependent-sum
+	url = https://github.com/mokus0/dependent-sum.git
