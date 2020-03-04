@@ -10,6 +10,7 @@
 {-# LANGUAGE TemplateHaskell #-}
 module NewRules where
 
+import Control.Monad.Reader
 import Data.GADT.Show
 import Data.GADT.Compare.TH
 import Data.GADT.Show.TH
@@ -149,7 +150,13 @@ mkModuleMap o e input = mdo
 
   return mod_map
 
-type Action t m a = NormalizedFilePath -> GlobalEnv t -> ModuleMapWithUpdater t -> MaybeT m (IdeResult a)
+type Action t m a = NormalizedFilePath -> ActionM t m (IdeResult a)
+
+type ActionM t m a = (ReaderT (REnv t) (MaybeT m) a)
+
+data REnv t = REnv { global :: GlobalEnv t
+                   , module_map :: ModuleMapWithUpdater t
+                   }
 
 newtype WrappedAction m t a = WrappedAction { getAction :: Action t m a }
 
@@ -188,7 +195,7 @@ mkModule opts env mm f = runDynamicWriterT $ do
     rule trigger (name :=> (WrappedAction act)) = mdo
         let wrap = fromMaybe ([], Nothing)
         act_trig <- switchHoldPromptly trigger (fmap (\e -> leftmost [trigger, e]) deps)
-        pm <- performEvent (traceAction ident (runEventWriterT (runMaybeT (act f genv mm))) <$! act_trig)
+        pm <- performEvent (traceAction ident (runEventWriterT (runMaybeT (flip runReaderT renv (act f)))) <$! act_trig)
         let (act_res, deps) = splitE pm
         d <- holdDyn ([], Nothing) (wrap <$> act_res)
         let (pm_diags, res) = splitDynPure d
@@ -199,6 +206,7 @@ mkModule opts env mm f = runDynamicWriterT $ do
         return (name :=> MDynamic res)
 
     genv = GlobalEnv opts env
+    renv = REnv genv mm
 
 traceAction ident a = a
 traceAction ident a = do
@@ -286,10 +294,10 @@ main = do
 
 -- Typechecks a module.
 typeCheckRule :: _ => ShakeDefinition m t
-typeCheckRule = define GetTypecheckedModule $ \file genv ms -> do
-  pm <- use_ ms GetParsedModule file
-  deps <- use_ ms GetDependencies file
-  packageState <- getSession genv
+typeCheckRule = define GetTypecheckedModule $ \file -> do
+  pm <- use_ GetParsedModule file
+  deps <- use_ GetDependencies file
+  packageState <- getSession
         -- Figure out whether we need TemplateHaskell or QuasiQuotes support
   --let graph_needs_th_qq = needsTemplateHaskellOrQQ $ hsc_mod_graph packageState
   --    file_uses_th_qq = uses_th_qq $ ms_hspp_opts (pm_mod_summary pm)
@@ -302,9 +310,9 @@ typeCheckRule = define GetTypecheckedModule $ \file genv ms -> do
               --tmrs <- uses_ TypeCheck (transitiveModuleDeps deps)
               --pure (zipWith addByteCode bytecodes tmrs)
             else  -}
-  tms <- uses_ ms GetTypecheckedModule (transitiveModuleDeps deps)
+  tms <- uses_ GetTypecheckedModule (transitiveModuleDeps deps)
   --setPriority priorityTypeCheck
-  IdeOptions{ optDefer = defer} <- getIdeOptions genv
+  IdeOptions{ optDefer = defer} <- getIdeOptions
   liftIO $ print ("typechecking", file)
   liftIO $ typecheckModule defer packageState tms pm
     where
@@ -315,14 +323,14 @@ typeCheckRule = define GetTypecheckedModule $ \file genv ms -> do
 
 
 getDependencyInformationRule :: _ => ShakeDefinition m t
-getDependencyInformationRule = define GetDependencyInfo $ \file genv ms -> do
-  (ds,rawDepInfo) <- rawDependencyInformation file genv ms
+getDependencyInformationRule = define GetDependencyInfo $ \file -> do
+  (ds,rawDepInfo) <- rawDependencyInformation file
   return $ case rawDepInfo of
     Just rawDepInfo -> ([], Just $  processDependencyInformation rawDepInfo)
     Nothing -> (ds, Nothing)
 
 rawDependencyInformation :: _ => Action t m RawDependencyInformation
-rawDependencyInformation f genv ms = do
+rawDependencyInformation f = do
     let (initialId, initialMap) = getPathId f emptyPathIdMap
     res <- go (IntSet.singleton $ getFilePathId initialId)
        (RawDependencyInformation IntMap.empty initialMap)
@@ -335,7 +343,7 @@ rawDependencyInformation f genv ms = do
             -- Pop f from the queue and process it
             Just (f, fs) -> do
                 let fId = FilePathId f
-                importsOrErr <- use ms GetLocatedImports (idToPath (rawPathIdMap rawDepInfo) fId)
+                importsOrErr <- use GetLocatedImports (idToPath (rawPathIdMap rawDepInfo) fId)
                 case importsOrErr of
                   Nothing ->
 
@@ -362,33 +370,38 @@ rawDependencyInformation f genv ms = do
 -- returns all transitive dependencies in topological order.
 -- NOTE: result does not include the argument file.
 getDependenciesRule :: _ => ShakeDefinition m t
-getDependenciesRule = define GetDependencies $ \fp genv ms -> do
-        depInfo@DependencyInformation{..} <- use_ ms GetDependencyInfo fp
+getDependenciesRule = define GetDependencies $ \fp -> do
+        depInfo@DependencyInformation{..} <- use_ GetDependencyInfo fp
         return ([], transitiveDeps depInfo fp)
 
 -- Source SpanInfo is used by AtPoint and Goto Definition.
 getSpanInfoRule :: _ => ShakeDefinition m t
-getSpanInfoRule = define GetSpanInfo $ \fp genv ms -> do
-  tc <- use_ ms GetTypecheckedModule fp
-  deps <- maybe (TransitiveDependencies [] []) id <$> use ms GetDependencies fp
-  tms <- catMaybes <$> uses ms GetTypecheckedModule (transitiveModuleDeps deps)
-  (fileImports, _) <- use_ ms GetLocatedImports fp
-  packageState <- getSession genv
+getSpanInfoRule = define GetSpanInfo $ \fp -> do
+  tc <- use_ GetTypecheckedModule fp
+  deps <- maybe (TransitiveDependencies [] []) id <$> use GetDependencies fp
+  tms <- catMaybes <$> uses GetTypecheckedModule (transitiveModuleDeps deps)
+  (fileImports, _) <- use_ GetLocatedImports fp
+  packageState <- getSession
   x <- liftIO $ getSrcSpanInfos packageState fileImports tc tms
   return ([], Just x)
 
-sampleMaybe :: _ => ModuleMapWithUpdater t
-                 -> RuleType a
+sampleMaybe :: (Monad m
+               , Reflex t
+               , EventWriter t () m
+               , MonadIO m
+               , MonadSample t m)
+                 => RuleType a
                  -> NormalizedFilePath
-                 -> MaybeT m a
-sampleMaybe m sel fp = do
-  mm <- lift $ sample (currentMap m)
+                 -> ActionM t m a
+sampleMaybe sel fp = do
+  m <- askModuleMap
+  mm <- lift $ lift $ sample (currentMap m)
   case M.lookup fp mm of
     Just ms -> do
-      d <- hoistMaybe (getMD <$> D.lookup sel (rules ms))
-      lift $ tellEvent (() <$! updated d)
-      MaybeT $ sample (current d)
-    Nothing -> MaybeT $ do
+      d <- lift $ hoistMaybe (getMD <$> D.lookup sel (rules ms))
+      lift $ lift $ tellEvent (() <$! updated d)
+      lift $ MaybeT $ sample (current d)
+    Nothing -> lift $ MaybeT $ do
       -- When the map updates, try again
       liftIO $ traceEventIO "FAILED TO FIND"
       tellEvent (() <$! updatedMap m)
@@ -397,51 +410,55 @@ sampleMaybe m sel fp = do
 
 use_ = sampleMaybe
 
-uses_ :: _ => ModuleMapWithUpdater t
-                 -> RuleType a
-                 -> [NormalizedFilePath]
-                 -> MaybeT m [a]
-uses_ m sel fps = mapM (sampleMaybe m sel) fps
+uses_ :: _ => RuleType a
+              -> [NormalizedFilePath]
+              -> ActionM t m [a]
+uses_ sel fps = mapM (sampleMaybe sel) fps
 
-uses :: _ => ModuleMapWithUpdater t
-                 -> RuleType a
-                 -> [NormalizedFilePath]
-                 -> MaybeT m [Maybe a]
-uses m sel fps = mapM (use m sel) fps
+uses :: _ => RuleType a
+             -> [NormalizedFilePath]
+             -> ActionM t m [Maybe a]
+uses sel fps = mapM (use sel) fps
 
-use :: _ => ModuleMapWithUpdater t
-                 -> RuleType a
-                 -> NormalizedFilePath
-                 -> MaybeT m (Maybe a)
-use m sel fp = do
-  mm <- lift $ sample (currentMap m)
+use :: (Monad m
+       , Reflex t
+       , EventWriter t () m
+       , MonadIO m
+       , MonadSample t m) => RuleType a
+         -> NormalizedFilePath
+         -> ActionM t m (Maybe a)
+use sel fp = do
+  m <- askModuleMap
+  mm <- lift $ lift $ sample (currentMap m)
   case M.lookup fp mm of
     Just ms -> do
-      d <- hoistMaybe (getMD <$> D.lookup sel (rules ms))
-      lift $ tellEvent (() <$! updated d)
-      lift $ sample (current d)
+      d <- lift $ hoistMaybe (getMD <$> D.lookup sel (rules ms))
+      lift $ lift $ tellEvent (() <$! updated d)
+      lift $ lift $ sample (current d)
     Nothing -> lift $ do
       liftIO $ traceEventIO "FAILED TO FIND"
-      tellEvent (() <$! updatedMap m)
+      lift $ tellEvent (() <$! updatedMap m)
       liftIO $ updateMap m [fp]
       return Nothing
 
 (<$!) v fa = fmap (\a -> a `seq` v) fa
 
-sampleG :: _ => Dynamic t a -> MaybeT m a
-sampleG d = lift $ sample (current d)
+sampleG :: _ => Dynamic t a -> ActionM t m a
+sampleG d = lift $ lift $ sample (current d)
 
-useGlobal :: (Reflex t, _) => GlobalEnv t -> (GlobalEnv t -> Dynamic t a) -> MaybeT m a
-useGlobal g sel = sampleG (sel g)
+useGlobal :: (Reflex t, _) => (GlobalEnv t -> Dynamic t a) -> GlobalEnv t -> ActionM t m a
+useGlobal sel g = sampleG (sel g)
 
-getIdeOptions g = useGlobal g opts
-getSession g = useGlobal g env
+getIdeOptions = useGlobal opts =<< asks global
+getSession = useGlobal env =<< asks global
+
+askModuleMap = asks (module_map)
 
 getLocatedImportsRule :: _ => ShakeDefinition m t
-getLocatedImportsRule = define GetLocatedImports $ \file genv ms -> do
-            pm <- use_ ms GetParsedModule file
-            env <- getSession genv
-            opt <- getIdeOptions genv
+getLocatedImportsRule = define GetLocatedImports $ \file -> do
+            pm <- use_  GetParsedModule file
+            env <- getSession
+            opt <- getIdeOptions
             let ms = pm_mod_summary pm
             let imports = [(False, imp) | imp <- ms_textual_imps ms] ++ [(True, imp) | imp <- ms_srcimps ms]
             let dflags = addRelativeImport file pm $ hsc_dflags env
@@ -474,10 +491,10 @@ doesExist nfp = let fp = fromNormalizedFilePath nfp in liftIO $ doesFileExist fp
 -- to the part of the network which may have changed.
 
 getParsedModuleRule :: _ => ShakeDefinition m t
-getParsedModuleRule = define GetParsedModule $ \fp genv ms -> do
+getParsedModuleRule = define GetParsedModule $ \fp -> do
     contents <- liftIO $ stringToStringBuffer <$> (readFile (fromNormalizedFilePath fp))
-    packageState <- getSession genv
-    opt <- getIdeOptions genv
+    packageState <- getSession
+    opt <- getIdeOptions
     (diag, res) <- liftIO $ parseModule opt packageState (fromNormalizedFilePath fp) (Just contents)
     case res of
         Nothing -> pure (diag, Nothing)
