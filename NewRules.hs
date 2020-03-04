@@ -154,6 +154,16 @@ type Action t m a = NormalizedFilePath -> ActionM t m (IdeResult a)
 
 type ActionM t m a = (ReaderT (REnv t) (MaybeT m) a)
 
+liftActionM :: Monad m => m a -> ActionM t m a
+liftActionM = lift . lift
+
+lr1 :: Monad m => ActionM t m (Maybe a) -> ActionM t m a
+lr1 ac = do
+  r <- ac
+  lift $ MaybeT (return r)
+
+
+
 data REnv t = REnv { global :: GlobalEnv t
                    , module_map :: ModuleMapWithUpdater t
                    }
@@ -394,19 +404,7 @@ sampleMaybe :: (Monad m
                  -> NormalizedFilePath
                  -> ActionM t m a
 sampleMaybe sel fp = do
-  m <- askModuleMap
-  mm <- lift $ lift $ sample (currentMap m)
-  case M.lookup fp mm of
-    Just ms -> do
-      d <- lift $ hoistMaybe (getMD <$> D.lookup sel (rules ms))
-      lift $ lift $ tellEvent (() <$! updated d)
-      lift $ MaybeT $ sample (current d)
-    Nothing -> lift $ MaybeT $ do
-      -- When the map updates, try again
-      liftIO $ traceEventIO "FAILED TO FIND"
-      tellEvent (() <$! updatedMap m)
-      liftIO $ updateMap m [fp]
-      return Nothing
+  lr1 (use sel fp)
 
 use_ = sampleMaybe
 
@@ -429,12 +427,12 @@ use :: (Monad m
          -> ActionM t m (Maybe a)
 use sel fp = do
   m <- askModuleMap
-  mm <- lift $ lift $ sample (currentMap m)
+  mm <- liftActionM $ sample (currentMap m)
   case M.lookup fp mm of
     Just ms -> do
       d <- lift $ hoistMaybe (getMD <$> D.lookup sel (rules ms))
-      lift $ lift $ tellEvent (() <$! updated d)
-      lift $ lift $ sample (current d)
+      liftActionM $ tellEvent (() <$! updated d)
+      liftActionM $ sample (current d)
     Nothing -> lift $ do
       liftIO $ traceEventIO "FAILED TO FIND"
       lift $ tellEvent (() <$! updatedMap m)
@@ -444,9 +442,9 @@ use sel fp = do
 (<$!) v fa = fmap (\a -> a `seq` v) fa
 
 sampleG :: _ => Dynamic t a -> ActionM t m a
-sampleG d = lift $ lift $ sample (current d)
+sampleG d = liftActionM $ sample (current d)
 
-useGlobal :: (Reflex t, _) => (GlobalEnv t -> Dynamic t a) -> GlobalEnv t -> ActionM t m a
+useGlobal :: (Reflex t, MonadSample t m) => (GlobalEnv t -> Dynamic t a) -> GlobalEnv t -> ActionM t m a
 useGlobal sel g = sampleG (sel g)
 
 getIdeOptions = useGlobal opts =<< asks global
