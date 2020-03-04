@@ -166,7 +166,7 @@ mkModule :: forall t m . _ => Dynamic t IdeOptions
               -> NormalizedFilePath
               -> m ((NormalizedFilePath, ModuleState t), Dynamic t [FileDiagnostic])
 mkModule opts env mm f = runDynamicWriterT $ do
-  (start, trigger) <- newTriggerEvent
+  -- List of all rules in the application
   let rules_raw = [getParsedModuleRule
                   , getLocatedImportsRule
                   , getDependencyInformationRule
@@ -175,13 +175,13 @@ mkModule opts env mm f = runDynamicWriterT $ do
                   , getSpanInfoRule
                   ]
 
+  (start, trigger) <- newTriggerEvent
   rule_dyns <- mapM (rule start) rules_raw
+  -- Run all the rules once to get them going
   liftIO $ trigger ()
 
-  let rules = D.fromList rule_dyns
-
 --  let diags = distributeListOverDyn [pm_diags]
-  let m = ModuleState{..}
+  let m = ModuleState { rules = D.fromList rule_dyns }
   return (f, m)
 
   where
