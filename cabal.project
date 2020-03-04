@@ -1,4 +1,4 @@
-packages: . ghcide/
+packages: . ghcide/ ../reflex
 
 allow-newer: reflex-basic-host:all
 

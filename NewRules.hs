@@ -10,6 +10,8 @@
 {-# LANGUAGE TemplateHaskell #-}
 module NewRules where
 
+import Data.Functor.Misc
+import Data.Functor.Compose
 import Control.Monad.Reader
 import Data.GADT.Show
 import Data.GADT.Compare.TH
@@ -65,6 +67,7 @@ import qualified GHC.Paths
 import Control.Concurrent
 import Reflex.Profiled
 import Debug.Trace
+import Data.Functor.Const
 
 data HoverMap = HoverMap
 type Diagnostics = String
@@ -100,7 +103,10 @@ concat <$> sequence [deriveGEq ''RuleType, deriveGCompare ''RuleType, deriveGSho
 
 newtype MDynamic t a = MDynamic { getMD :: Dynamic t (Maybe a) }
 
-data ModuleState t = ModuleState { rules :: DMap RuleType (MDynamic t) }
+data ModuleState t = ModuleState { rules :: Dynamic t (DMap RuleType (MDynamic t))
+                                 , updateMS :: DMap RuleType (ComposeMaybe (Const ())) -> IO ()
+                                 }
+
 
 {-
 data ModuleState t = ModuleState { fileChanged :: Event t NormalizedFilePath
@@ -121,7 +127,7 @@ type ModuleMap t = (Dynamic t (M.Map NormalizedFilePath (ModuleState t)))
 data ModuleMapWithUpdater t =
   MMU {
     getMap :: ModuleMap t
-    , updateMap :: [NormalizedFilePath] -> IO ()
+    , updateMap :: [(NormalizedFilePath, (D.Some RuleType))] -> IO ()
     }
 
 currentMap = current . getMap
@@ -140,10 +146,10 @@ mkModuleMap o e input = mdo
   -- An event which is triggered to update the incremental
   (map_update, update_trigger) <- newTriggerEvent
   map_update' <- fmap concat <$> batchOccurrences 0.01 map_update
-  let mk_patch ((fp, v), _) = v
-      mkM fp = (fp, Just (mkModule o e (MMU mod_map update_trigger) fp))
+  let mk_patch ((fp, v)) = v
+      mkM (fp, rid) = (fp, Just (mkModule o e (MMU mod_map update_trigger) fp rid))
       mk_module fp act _ = mk_patch <$> act
-      inp = M.fromList . map mkM <$> mergeWith (++) [(singleton <$> input), map_update']
+      inp = M.fromList . map mkM <$> mergeWith (++) [(singleton . (, D.Some GetTypecheckedModule) <$> input), map_update']
 --  let input_event = (fmap mk_patch . mkModule o e mod_map <$> input)
 
   mod_map <- listWithKeyShallowDiff M.empty inp mk_module  --(mergeWith (<>) [input_event, map_update])
@@ -181,28 +187,47 @@ mkModule :: forall t m . _ => Dynamic t IdeOptions
               -> Dynamic t HscEnv
               -> ModuleMapWithUpdater t
               -> NormalizedFilePath
-              -> m ((NormalizedFilePath, ModuleState t), Dynamic t [FileDiagnostic])
-mkModule opts env mm f = runDynamicWriterT $ do
+              -> D.Some RuleType
+              -> m ((NormalizedFilePath, ModuleState t))
+mkModule opts env mm f (D.Some rid) = do
   -- List of all rules in the application
-  let rules_raw = [getParsedModuleRule
-                  , getLocatedImportsRule
-                  , getDependencyInformationRule
-                  , getDependenciesRule
-                  , typeCheckRule
-                  , getSpanInfoRule
-                  ]
+  let rules_raw = D.fromList
+                    [getParsedModuleRule
+                    , getLocatedImportsRule
+                    , getDependencyInformationRule
+                    , getDependenciesRule
+                    , typeCheckRule
+                    , getSpanInfoRule
+                    ]
 
-  (start, trigger) <- newTriggerEvent
-  rule_dyns <- mapM (rule start) rules_raw
-  -- Run all the rules once to get them going
-  liftIO $ trigger ()
+  let init_rule rid = do
+        (start, trigger) <- newTriggerEvent
+        (dyns, _) <- runDynamicWriterT $
+                      rule start rid
+                                      $ (D.findWithDefault (error "NOT FOUND")
+                                        rid rules_raw)
+        liftIO $ trigger ()
+        return dyns
+
+  -- An event which is triggered to update the incremental
+  (ms_update, update_trigger) <- newTriggerEvent
+  ms_update' <- fmap (foldl D.union D.empty) <$> batchOccurrences 0.01 ms_update
+  let mk_patch ((fp, v), _) = v
+--      mkM fp = (fp, Just (mkModule o e (MMU mod_map update_trigger) fp))
+      mk_ms rt v _ = Compose (init_rule rt)
+      inp =  ms_update
+--  let input_event = (fmap mk_patch . mkModule o e mod_map <$> input)
+
+  mod_map <- dmapShallowDiff (D.singleton rid ((Const ()))) inp mk_ms
+
 
 --  let diags = distributeListOverDyn [pm_diags]
-  let m = ModuleState { rules = D.fromList rule_dyns }
+  let m = ModuleState { rules = incrementalToDynamic mod_map
+                      , updateMS = update_trigger }
   return (f, m)
 
   where
-    rule trigger (name :=> (WrappedAction act)) = mdo
+    rule trigger name (WrappedAction act) = mdo
         let wrap = fromMaybe ([], Nothing)
         act_trig <- switchHoldPromptly trigger (fmap (\e -> leftmost [trigger, e]) deps)
         pm <- performEvent (traceAction ident (runEventWriterT (runMaybeT (flip runReaderT renv (act f)))) <$! act_trig)
@@ -212,8 +237,8 @@ mkModule opts env mm f = runDynamicWriterT $ do
         tellDyn pm_diags
         let ident = show f ++ ": " ++ gshow name
         res' <- improvingMaybe res
---        return (traceDynE ("D:" ++ ident) res')
-        return (name :=> MDynamic res)
+        return (MDynamic (traceDynE ("D:" ++ ident) res'))
+--        return (MDynamic res)
 
     genv = GlobalEnv opts env
     renv = REnv genv mm
@@ -430,13 +455,22 @@ use sel fp = do
   mm <- liftActionM $ sample (currentMap m)
   case M.lookup fp mm of
     Just ms -> do
-      d <- lift $ hoistMaybe (getMD <$> D.lookup sel (rules ms))
-      liftActionM $ tellEvent (() <$! updated d)
-      liftActionM $ sample (current d)
+      rs <- liftActionM $ sample (current $ rules ms)
+      case D.lookup sel rs of
+        Nothing -> do
+          -- Rule has never been demanded before, load it
+          liftIO $ putStrLn ("Initialising" ++ gshow sel)
+          liftIO $ updateMS ms (D.singleton sel (ComposeMaybe (Just (Const ()))))
+          lift $ lift $ tellEvent (() <$ updated (rules ms))
+          return Nothing
+        Just (MDynamic d) -> do
+          liftActionM $ tellEvent (() <$! updated d)
+          liftActionM $ sample (current d)
     Nothing -> lift $ do
+      -- File has never been demanded before, load it
       liftIO $ traceEventIO "FAILED TO FIND"
       lift $ tellEvent (() <$! updatedMap m)
-      liftIO $ updateMap m [fp]
+      liftIO $ updateMap m [(fp, D.Some sel)]
       return Nothing
 
 (<$!) v fa = fmap (\a -> a `seq` v) fa
