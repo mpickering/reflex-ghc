@@ -134,14 +134,16 @@ singleton x = [x]
 
 mkModuleMap :: forall t m . (_ ) => Dynamic t IdeOptions
                  -> Dynamic t HscEnv
+                 -> [ShakeDefinition (Performable m) t]
                  -> Event t NormalizedFilePath
                  -> m (ModuleMap t)
-mkModuleMap o e input = mdo
+mkModuleMap o e rules_raw input = mdo
+
   -- An event which is triggered to update the incremental
   (map_update, update_trigger) <- newTriggerEvent
   map_update' <- fmap concat <$> batchOccurrences 0.01 map_update
   let mk_patch ((fp, v), _) = v
-      mkM fp = (fp, Just (mkModule o e (MMU mod_map update_trigger) fp))
+      mkM fp = (fp, Just (mkModule o e rules_raw (MMU mod_map update_trigger) fp))
       mk_module fp act _ = mk_patch <$> act
       inp = M.fromList . map mkM <$> mergeWith (++) [(singleton <$> input), map_update']
 --  let input_event = (fmap mk_patch . mkModule o e mod_map <$> input)
@@ -152,10 +154,10 @@ mkModuleMap o e input = mdo
 
 type Action t m a = NormalizedFilePath -> ActionM t m (IdeResult a)
 
-type ActionM t m a = (ReaderT (REnv t) (MaybeT m) a)
+type ActionM t m a = (ReaderT (REnv t) (MaybeT (EventWriterT t () m)) a)
 
 liftActionM :: Monad m => m a -> ActionM t m a
-liftActionM = lift . lift
+liftActionM = lift . lift . lift
 
 lr1 :: Monad m => ActionM t m (Maybe a) -> ActionM t m a
 lr1 ac = do
@@ -168,7 +170,8 @@ data REnv t = REnv { global :: GlobalEnv t
                    , module_map :: ModuleMapWithUpdater t
                    }
 
-newtype WrappedAction m t a = WrappedAction { getAction :: Action t m a }
+newtype WrappedAction m t a =
+          WrappedAction { getAction :: Action t m a }
 
 type Definition f t  = D.DSum RuleType (f t)
 
@@ -177,20 +180,15 @@ type ShakeDefinition m t = Definition (WrappedAction m) t
 define :: RuleType a -> Action t m a -> ShakeDefinition m t
 define rn a = rn :=> WrappedAction a
 
-mkModule :: forall t m . _ => Dynamic t IdeOptions
+mkModule :: forall t m . (MonadIO m, PerformEvent t m, TriggerEvent t m, Monad m, Reflex t, MonadFix m, _) =>
+                 Dynamic t IdeOptions
               -> Dynamic t HscEnv
+              -> [ShakeDefinition (Performable m) t]
               -> ModuleMapWithUpdater t
               -> NormalizedFilePath
               -> m ((NormalizedFilePath, ModuleState t), Dynamic t [FileDiagnostic])
-mkModule opts env mm f = runDynamicWriterT $ do
+mkModule opts env rules_raw mm f = runDynamicWriterT $ do
   -- List of all rules in the application
-  let rules_raw = [getParsedModuleRule
-                  , getLocatedImportsRule
-                  , getDependencyInformationRule
-                  , getDependenciesRule
-                  , typeCheckRule
-                  , getSpanInfoRule
-                  ]
 
   (start, trigger) <- newTriggerEvent
   rule_dyns <- mapM (rule start) rules_raw
@@ -279,7 +277,16 @@ main = do
 --    env :: Dynamic t HscEnv
     env <- holdDyn session never
 
-    mmap <- mkModuleMap opts env input
+
+    let rules_raw = [getParsedModuleRule
+                    , getLocatedImportsRule
+                    , getDependencyInformationRule
+                    , getDependenciesRule
+                    , typeCheckRule
+                    , getSpanInfoRule
+                    ]
+
+    mmap <- mkModuleMap opts env rules_raw input
 --    (mmap, diags2) <- test opts env modules input
     let diags = M.empty
         hover = M.empty
@@ -397,7 +404,6 @@ getSpanInfoRule = define GetSpanInfo $ \fp -> do
 
 sampleMaybe :: (Monad m
                , Reflex t
-               , EventWriter t () m
                , MonadIO m
                , MonadSample t m)
                  => RuleType a
@@ -420,7 +426,6 @@ uses sel fps = mapM (use sel) fps
 
 use :: (Monad m
        , Reflex t
-       , EventWriter t () m
        , MonadIO m
        , MonadSample t m) => RuleType a
          -> NormalizedFilePath
@@ -431,11 +436,11 @@ use sel fp = do
   case M.lookup fp mm of
     Just ms -> do
       d <- lift $ hoistMaybe (getMD <$> D.lookup sel (rules ms))
-      liftActionM $ tellEvent (() <$! updated d)
+      lift $ lift $ tellEvent (() <$! updated d)
       liftActionM $ sample (current d)
-    Nothing -> lift $ do
+    Nothing -> do
       liftIO $ traceEventIO "FAILED TO FIND"
-      lift $ tellEvent (() <$! updatedMap m)
+      lift $ lift $ tellEvent (() <$! updatedMap m)
       liftIO $ updateMap m [fp]
       return Nothing
 
